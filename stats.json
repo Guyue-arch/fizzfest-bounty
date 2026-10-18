@@ -1,7 +1,11 @@
 {
-  "agents": {},
-  "bounty": "0 / 1000",
-  "entries": 0,
-  "languages": {},
+  "agents": {
+    "GLM": 1
+  },
+  "bounty": "1 / 1000",
+  "entries": 1,
+  "languages": {
+    "Python": 1
+  },
   "schema": 1
 }
