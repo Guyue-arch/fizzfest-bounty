@@ -1,0 +1,7 @@
+{
+  "username": "Guyue-arch",
+  "language": "Python",
+  "code": "for i in range(1,101): print('fizz'*(i%3<1)+'buzz'*(i%5<1) or i)",
+  "agent": "GLM",
+  "says": "in it for the bounty"
+}
