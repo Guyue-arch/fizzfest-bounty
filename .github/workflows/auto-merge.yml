@@ -1,0 +1,138 @@
+name: auto-merge
+
+# Merges valid entry PRs automatically. Zero human wait. Duplicate
+# entries get a friendly note and stay open (re-openable, never
+# force-closed).
+#
+# SECURITY MODEL — read before editing:
+# - pull_request_target runs THIS file from main with the repo's token,
+#   even when the PR comes from a fork.
+# - We NEVER check out or execute the PR's code. There is no
+#   actions/checkout in this workflow at all. We only read PR metadata
+#   through the API and merge.
+# - Fail closed: any unexpected error, any file outside
+#   entries/<username>.json, more than one file, or the do-not-merge
+#   label = no merge. A second entry for the same person = friendly
+#   comment, and the PR stays open (re-openable, not closed).
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write  # narrow: only to dispatch the stats recount after a bot merge
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Gate, validate, merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          echo "auto-merge: PR #$PR from @$AUTHOR"
+
+          # -- 0. state + maintainer escape hatch --------------------
+          pr_json=$(gh pr view "$PR" -R "$REPO" --json state,labels)
+          state=$(jq -r .state <<<"$pr_json")
+          if [ "$state" != "OPEN" ]; then
+            echo "PR is $state; nothing to do."
+            exit 0
+          fi
+
+          if jq -e '.labels[]? | select(.name == "do-not-merge")' <<<"$pr_json" >/dev/null; then
+            echo "do-not-merge label present; standing down."
+            exit 0
+          fi
+
+          # -- 1. exactly one file, newly added, entries/<login>.json
+          files_json=$(gh api "repos/$REPO/pulls/$PR/files?per_page=100")
+          if ! jq -e 'type == "array"' <<<"$files_json" >/dev/null; then
+            echo "::error::Unexpected response from the files API; refusing to merge."
+            exit 1
+          fi
+          count=$(jq 'length' <<<"$files_json")
+          if [ "$count" -ge 100 ]; then
+            echo "::error::Too many changed files to verify safely; refusing to merge."
+            exit 1
+          fi
+          if [ "$count" -ne 1 ]; then
+            echo "::error::This PR changed $count files. Add exactly one: entries/$AUTHOR.json"
+            exit 1
+          fi
+
+          path=$(jq -r '.[0].filename' <<<"$files_json")
+          status=$(jq -r '.[0].status' <<<"$files_json")
+          expected="entries/$AUTHOR.json"
+
+          if ! grep -qxE 'entries/[^/]+\.json' <<<"$path"; then
+            echo "::error::Refusing to merge: '$path' is outside entries/. Only your own entries/<username>.json is auto-mergeable."
+            exit 1
+          fi
+          if [ "$path" != "$expected" ]; then
+            echo "::error::Your file must be named '$expected' so it matches your GitHub username."
+            exit 1
+          fi
+          if [ "$status" != "added" ]; then
+            echo "::error::Your entry must be a new file (this one was '$status'). One entry per person, added once."
+            exit 1
+          fi
+
+          # -- 2. one entry per person -------------------------------
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/contents/entries/$AUTHOR.json")
+          case "$code" in
+            200)
+              gh pr comment "$PR" -R "$REPO" --body "You're already on the wall — one entry per person. 🎉 Your original entry lives forever, so this second one stays open instead of merging. If you think this is an error — for example a different person used to own this username, or your original entry was removed — reply here and a human will take a look. The PR stays open and re-openable in the meantime; nothing is deleted."
+              exit 0
+              ;;
+            404)
+              ;;
+            *)
+              echo "::error::Could not check for an existing entry (HTTP $code); refusing to merge."
+              exit 1
+              ;;
+          esac
+
+          # -- 3. the entry itself must be valid ----------------------
+          raw_url=$(jq -r '.[0].raw_url' <<<"$files_json")
+          if ! curl -fsSL "$raw_url" -o /tmp/entry.json; then
+            echo "::error::Could not read the entry file; refusing to merge."
+            exit 1
+          fi
+          if ! jq -e --arg author "$AUTHOR" '
+            type == "object"
+            and (.username == $author)
+            and ((.language | type) == "string") and ((.language | length) > 0) and ((.language | length) <= 30)
+            and ((.code | type) == "string") and ((.code | length) > 0) and ((.code | length) <= 400)
+            and ((.agent == null) or (((.agent | type) == "string") and ((.agent | length) > 0) and ((.agent | length) <= 40)))
+            and ((.says == null) or (((.says | type) == "string") and ((.says | length) > 0) and ((.says | length) <= 100)))
+          ' /tmp/entry.json > /dev/null; then
+            echo "::error::Entry JSON failed validation. Copy entries/_example.json and keep the schema in AGENTS.md."
+            exit 1
+          fi
+
+          # -- 4. merge -----------------------------------------------
+          echo "All gates passed; merging PR #$PR."
+          gh pr merge "$PR" -R "$REPO" --squash
+
+          # Squash-merges authored by github-actions[bot] do not fire `push`
+          # events (GitHub's anti-recursion rule), so stats.yml would never
+          # run and the README's live counter would stall. Dispatch it.
+          gh workflow run stats.yml -R "$REPO" --ref main \
+            || echo "::warning::stats recount dispatch failed; trigger it manually"
+
+          gh pr comment "$PR" -R "$REPO" --body "🤖 fizzbot: merged automatically. You're on the wall — nothing left to do. Your badge and bounty number are in the welcome comment. 🥤" || true
